@@ -1,0 +1,12 @@
+version: "3.8"
+services:
+  neo4j:
+    image: neo4j:5.19
+    container_name: kg-neo4j
+    environment:
+      NEO4J_AUTH: "neo4j/password"
+    ports:
+      - "7687:7687"   # Bolt
+      - "7474:7474"   # Browser
+    volumes:
+      - ./data:/data

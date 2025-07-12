@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - 'apps/**'
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  ROC_VERSION: nightly-2025-06-01          # 固定 or hasnep/setup-roc の tag
+  NODE_VERSION_FILE: '.nvmrc'
+
+jobs:
+# ────────── 1. Elm ──────────
+  elm:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || contains(github.event.pull_request.changed_files, 'apps/elm-ui/')
+    defaults: { run: { working-directory: apps/elm-ui } }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          node-version-file: ${{ env.NODE_VERSION_FILE }}
+          cache: pnpm
+
+      - name: Restore Elm cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            apps/elm-ui/elm-stuff
+            ~/.elm
+          key: elm-${{ runner.os }}-${{ hashFiles('apps/elm-ui/elm.json') }}
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec elm make src/Main.elm --output=dist/main.js
+      - uses: actions/upload-artifact@v4
+        with:
+          name: elm-dist
+          path: apps/elm-ui/dist
+
+# ────────── 2. Roc ──────────
+  roc:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || contains(github.event.pull_request.changed_files, 'apps/roc-api/')
+    defaults: { run: { working-directory: apps/roc-api } }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hasnep/setup-roc@v1
+        with: 
+            version: ${{ env.ROC_VERSION }} 
+
+      - name: Cache Roc build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/roc
+          key: roc-${{ runner.os }}-${{ env.ROC_VERSION }}-${{ hashFiles('apps/roc-api/src/**/*.roc') }}
+
+      - run: roc build src/backend.roc --output kg-backend
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roc-bin
+          path: apps/roc-api/kg-backend
+
+# ────────── 3. Rust / Tauri ──────────
+  tauri:
+    needs: [elm, roc]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || contains(github.event.pull_request.changed_files, 'apps/tauri-shell/')
+    defaults: { run: { working-directory: apps/tauri-shell } }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download UI/Backend artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Move frontend & backend
+        run: |
+          mv artifacts/elm-dist dist
+          mv artifacts/roc-bin/kg-backend src-tauri/bin/kg-backend
+          chmod +x src-tauri/bin/kg-backend
+
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+          profile: minimal
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/tauri-shell/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('apps/tauri-shell/Cargo.lock') }}
+
+      - run: cargo fmt -- --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tauri-bundle
+          path: apps/tauri-shell/target/release/bundle
+
+# ────────── 4. Release (optional) ──────────
+  release:
+    needs: tauri
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tauri-bundle
+          path: bundle
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: bundle/**
