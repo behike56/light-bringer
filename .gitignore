@@ -1,0 +1,21 @@
+.DS_Store
+
+# Elm UI
+apps/elm-ui/dist/
+apps/elm-ui/node_modules/
+apps/elm-ui/elm-stuff/
+
+
+# Roc API
+apps/roc-api/target/
+
+
+# Tauri Shell
+apps/tauri-shell/node_modules/
+apps/tauri-shell/target/
+apps/tauri-shell/src-tauri/target/
+apps/tauri-shell/src-tauri/Cargo.lock
+
+
+# docker
+docker/data/

@@ -1,0 +1,10 @@
+# FIXME: ★ 最小限の “Hello Node” グラフ を Elm ↔︎ Roc ↔︎ Neo4j で疎通するだけに絞っています。
+type Node {
+  id: ID!
+  label: String!
+}
+
+# シンプルに 1 クエリだけ
+type Query {
+  node(id: ID!): Node
+}

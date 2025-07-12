@@ -1,0 +1,11 @@
+{
+    "name": "elm-ui",
+    "scripts": {
+        "dev": "elm-live src/Main.elm --path-to-elm=/opt/homebrew/Cellar/elm/0.19.1/bin/elm --dir=static --open --pushstate -- --output=dist/main.js"
+    },
+    "dependencies": {},
+    "devDependencies": {
+        "elm": "^0.19.1-6",
+        "elm-live": "^4.0.2"
+    }
+}

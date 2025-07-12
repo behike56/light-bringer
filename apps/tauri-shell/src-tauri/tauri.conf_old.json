@@ -1,0 +1,28 @@
+{
+    "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/v2/schema.json",
+    "identifier": "com.example.lightbringer",
+    "productName": "Light Bringer PoC",
+    "version": "0.1.0",
+    "build": {
+        "frontendDist": "../elm-ui/dist",
+        "beforeBuildCommand": "",
+        "beforeDevCommand": "",
+        "devUrl": "http://localhost:5173"
+    },
+    "app": {
+        "windows": [
+            {
+                "title": "Light Bringer PoC",
+                "width": 800,
+                "height": 600
+            }
+        ],
+        "security": {
+            "capabilities": [
+                "default"
+            ]
+        }
+    },
+    "bundle": {},
+    "plugins": {}
+}
