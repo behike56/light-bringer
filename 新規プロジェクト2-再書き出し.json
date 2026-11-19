@@ -1,0 +1,33 @@
+{
+  "format_version": 1,
+  "nodes": [
+    {
+      "id": "9bf0f893-6d58-4b08-bf35-4fe5fa2f73bd",
+      "name": "食べ物"
+    },
+    {
+      "id": "a11cbf89-0ad5-4d24-a218-9f3a56fb6703",
+      "name": "バナナ"
+    }
+  ],
+  "edges": [
+    {
+      "id": "3188ec1f-81fd-41b8-9cff-94e0002c63c3",
+      "source_id": "9bf0f893-6d58-4b08-bf35-4fe5fa2f73bd",
+      "target_id": "a11cbf89-0ad5-4d24-a218-9f3a56fb6703",
+      "label": "内包"
+    }
+  ],
+  "node_positions": [
+    {
+      "node_id": "9bf0f893-6d58-4b08-bf35-4fe5fa2f73bd",
+      "x": 109.734375,
+      "y": 100.0
+    },
+    {
+      "node_id": "a11cbf89-0ad5-4d24-a218-9f3a56fb6703",
+      "x": 405.0390625,
+      "y": 93.53515625
+    }
+  ]
+}
