@@ -175,6 +175,26 @@ impl Graph {
     }
 
     pub fn put_position(&mut self, position: Position) -> Result<()> {
+        self.validate_position(position)?;
+        self.positions.insert(position.node_id, position);
+        Ok(())
+    }
+
+    pub fn put_positions(&mut self, positions: &[Position]) -> Result<()> {
+        let mut seen = HashSet::with_capacity(positions.len());
+        for &position in positions {
+            check_unique(&mut seen, position.node_id)?;
+            self.validate_position(position)?;
+        }
+        self.positions.extend(
+            positions
+                .iter()
+                .map(|position| (position.node_id, *position)),
+        );
+        Ok(())
+    }
+
+    fn validate_position(&self, position: Position) -> Result<()> {
         ensure!(
             self.nodes.contains_key(&position.node_id),
             "node_id {} のノードがありません",
@@ -184,7 +204,6 @@ impl Graph {
             position.x.is_finite() && position.y.is_finite(),
             "x と y には有限の値を指定してください"
         );
-        self.positions.insert(position.node_id, position);
         Ok(())
     }
 

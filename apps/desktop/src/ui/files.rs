@@ -38,7 +38,7 @@ impl Command {
 
 enum Outcome {
     Stay,
-    SavedAs(Arc<ProjectFile>),
+    SavedAs(Arc<ProjectFile>, Graph),
     Exported,
     Opened(Arc<ProjectFile>, Graph),
     ProjectClosed,
@@ -104,8 +104,12 @@ impl Editor {
                                 editor.project = None;
                                 editor.graph = Graph::default();
                                 editor.form = None;
+                                editor.multi_selection.clear();
                                 editor.viewport = Default::default();
-                                editor.dirty = false;
+                                editor.alignment_change = None;
+                                editor.saved_positions.clear();
+                                editor.positions_dirty = false;
+                                editor.content_dirty = false;
                                 editor.status = None;
                                 editor.error = None;
                                 window.set_window_title("Light Bringer");
@@ -113,8 +117,8 @@ impl Editor {
                             }
                             Ok(Outcome::Close) => window.remove_window(),
                             Ok(Outcome::Quit) => cx.quit(),
-                            Ok(Outcome::SavedAs(project)) => {
-                                editor.dirty = false;
+                            Ok(Outcome::SavedAs(project, graph)) => {
+                                editor.mark_saved(&graph);
                                 editor.status = Some("別名で保存しました".to_owned());
                                 editor.set_project(project, window);
                             }
@@ -123,10 +127,14 @@ impl Editor {
                                     Some("保存済みのグラフを JSON に書き出しました".to_owned());
                             }
                             Ok(Outcome::Opened(project, mut graph)) => {
-                                editor.dirty = graph.nodes().len() != graph.positions().len();
+                                editor.saved_positions.clone_from(graph.positions());
                                 graph.place_unpositioned();
                                 editor.graph = graph;
+                                editor.refresh_positions_dirty();
+                                editor.content_dirty = false;
                                 editor.form = None;
+                                editor.multi_selection.clear();
+                                editor.alignment_change = None;
                                 editor.viewport.reset();
                                 editor.status = None;
                                 editor.set_project(project, window);
@@ -173,15 +181,17 @@ fn capture_snapshot(
 
 async fn save(editor: &WeakEntity<Editor>, cx: &mut AsyncWindowContext) -> Result<()> {
     let (project, graph) = capture_snapshot(editor, cx)?;
-    cx.background_executor()
+    let saved_graph = cx
+        .background_executor()
         .spawn(async move {
             project
                 .save(&graph)
-                .context("プロジェクトの保存に失敗しました")
+                .context("プロジェクトの保存に失敗しました")?;
+            Ok::<_, anyhow::Error>(graph)
         })
         .await?;
     editor.update(cx, |editor, cx| {
-        editor.dirty = false;
+        editor.mark_saved(&saved_graph);
         editor.status = Some("保存しました".to_owned());
         cx.notify();
     })?;
@@ -301,8 +311,8 @@ async fn run_command(
                 return Ok(Outcome::Stay);
             };
             let (_, graph) = capture_snapshot(editor, cx)?;
-            let (project, _) = create_project(path, graph, cx).await?;
-            Ok(Outcome::SavedAs(project))
+            let (project, graph) = create_project(path, graph, cx).await?;
+            Ok(Outcome::SavedAs(project, graph))
         }
         Command::CloseProject => Ok(Outcome::ProjectClosed),
         Command::Close => Ok(Outcome::Close),
@@ -395,7 +405,7 @@ mod tests {
             gpui_kit::open_window(options, cx, |window, cx| {
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
-                cx.new(|_| Editor::new(focus))
+                cx.new(|cx| Editor::new(focus, cx))
             })
             .unwrap()
         })

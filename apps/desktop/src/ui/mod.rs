@@ -1,8 +1,12 @@
+mod alignment;
 mod canvas;
 mod files;
 mod form;
 
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use gpui_kit::{
     component::{
@@ -18,11 +22,11 @@ use gpui_kit::{
 use uuid::Uuid;
 
 use crate::{
-    graph::{Graph, ProjectMode, card_label},
+    graph::{Graph, Position, ProjectMode, card_label},
     project::ProjectFile,
 };
 
-use self::{canvas::Viewport, files::Command, form::Form};
+use self::{alignment::AlignmentChange, canvas::Viewport, files::Command, form::Form};
 
 gpui_kit::actions!(
     light_bringer,
@@ -47,11 +51,16 @@ enum Selection {
 
 struct Editor {
     focus: FocusHandle,
+    canvas_focus: FocusHandle,
     project: Option<Arc<ProjectFile>>,
     graph: Graph,
     form: Option<Form>,
+    multi_selection: BTreeSet<Uuid>,
     viewport: Viewport,
-    dirty: bool,
+    alignment_change: Option<AlignmentChange>,
+    saved_positions: BTreeMap<Uuid, Position>,
+    positions_dirty: bool,
+    content_dirty: bool,
     busy: bool,
     status: Option<String>,
     error: Option<String>,
@@ -112,7 +121,7 @@ pub fn run() {
             match open_window(options, cx, |window, cx| {
                 let focus = cx.focus_handle();
                 focus.focus(window, cx);
-                cx.new(|_| Editor::new(focus))
+                cx.new(|cx| Editor::new(focus, cx))
             }) {
                 Ok((handle, editor)) => {
                     let editor = editor.downgrade();
@@ -142,14 +151,19 @@ pub fn run() {
 }
 
 impl Editor {
-    fn new(focus: FocusHandle) -> Self {
+    fn new(focus: FocusHandle, cx: &App) -> Self {
         Self {
             focus,
+            canvas_focus: cx.focus_handle(),
             project: None,
             graph: Graph::default(),
             form: None,
+            multi_selection: BTreeSet::new(),
             viewport: Viewport::default(),
-            dirty: false,
+            alignment_change: None,
+            saved_positions: BTreeMap::new(),
+            positions_dirty: false,
+            content_dirty: false,
             busy: false,
             status: None,
             error: None,
@@ -160,8 +174,42 @@ impl Editor {
         self.form.as_ref().map(|form| form.selection)
     }
 
+    fn single_card(&self) -> Option<Uuid> {
+        match self.selection() {
+            Some(Selection::Node(id)) if self.graph.positions().contains_key(&id) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn selected_cards(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.single_card()
+            .into_iter()
+            .chain(self.multi_selection.iter().copied())
+    }
+
+    fn selected_card_count(&self) -> usize {
+        self.multi_selection.len() + usize::from(self.single_card().is_some())
+    }
+
+    fn is_selected(&self, item: Selection) -> bool {
+        self.selection() == Some(item)
+            || matches!(item, Selection::Node(id) if self.multi_selection.contains(&id))
+    }
+
     fn has_changes(&self, cx: &App) -> bool {
-        self.dirty || self.form.as_ref().is_some_and(|form| form.dirty(cx))
+        self.content_dirty
+            || self.positions_dirty
+            || self.form.as_ref().is_some_and(|form| form.dirty(cx))
+    }
+
+    fn refresh_positions_dirty(&mut self) {
+        self.positions_dirty = self.graph.positions() != &self.saved_positions;
+    }
+
+    fn mark_saved(&mut self, graph: &Graph) {
+        self.saved_positions.clone_from(graph.positions());
+        self.refresh_positions_dirty();
+        self.content_dirty = false;
     }
 
     fn can_save(&self, cx: &App) -> bool {
@@ -177,10 +225,47 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.change_selection(selection, BTreeSet::new(), new, window, cx)
+    }
+
+    fn select_cards(
+        &mut self,
+        cards: BTreeSet<Uuid>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if cards.len() <= 1 {
+            self.select(
+                cards.first().copied().map(Selection::Node),
+                false,
+                window,
+                cx,
+            )
+        } else {
+            self.change_selection(None, cards, false, window, cx)
+        }
+    }
+
+    fn toggle_card(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let mut cards: BTreeSet<_> = self.selected_cards().collect();
+        if !cards.remove(&id) {
+            cards.insert(id);
+        }
+        self.select_cards(cards, window, cx)
+    }
+
+    fn change_selection(
+        &mut self,
+        selection: Option<Selection>,
+        cards: BTreeSet<Uuid>,
+        new: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.busy {
             return false;
         }
-        if self.selection() == selection {
+        if self.selection() == selection && self.multi_selection == cards {
             return true;
         }
         if self.form.as_ref().is_some_and(|form| form.dirty(cx)) {
@@ -192,6 +277,7 @@ impl Editor {
             _ => None,
         };
         self.form = selection.map(|item| Form::new(item, &self.graph, source, window, cx));
+        self.multi_selection = cards;
         if new && let Some(form) = &self.form {
             form.focus(window, cx);
         }
@@ -205,7 +291,8 @@ impl Editor {
             && form.dirty(cx)
         {
             form.apply(&mut self.graph, window, cx)?;
-            self.dirty = true;
+            self.content_dirty = true;
+            self.refresh_positions_dirty();
             self.status = None;
         }
         self.error = None;
@@ -242,7 +329,7 @@ impl Editor {
         self.form = self
             .selection()
             .map(|item| Form::new(item, &self.graph, None, window, cx));
-        self.dirty = true;
+        self.content_dirty = true;
         self.status = None;
         self.error = None;
         cx.notify();
@@ -286,11 +373,15 @@ impl Editor {
                     editor.busy = false;
                     if matches!(answer, Ok(1)) {
                         match selection {
-                            Selection::Node(id) => editor.graph.remove_node(id),
+                            Selection::Node(id) => {
+                                editor.graph.remove_node(id);
+                                editor.invalidate_alignment(id);
+                                editor.refresh_positions_dirty();
+                            }
                             Selection::Edge(id) => editor.graph.remove_edge(id),
                         }
                         editor.form = None;
-                        editor.dirty = true;
+                        editor.content_dirty = true;
                         editor.status = None;
                         editor.error = None;
                     }
@@ -508,7 +599,7 @@ impl Editor {
         secondary: String,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let selected = self.selection() == Some(item);
+        let selected = self.is_selected(item);
         let (category, id) = match item {
             Selection::Node(id) => ("node", id),
             Selection::Edge(id) => ("edge", id),
@@ -543,8 +634,14 @@ impl Editor {
                         .child(secondary),
                 )
             })
-            .on_click(cx.listener(move |editor, _, window, cx| {
-                editor.select(Some(item), false, window, cx);
+            .on_click(cx.listener(move |editor, event: &ClickEvent, window, cx| {
+                if let Selection::Node(id) = item
+                    && event.modifiers().shift
+                {
+                    editor.toggle_card(id, window, cx);
+                } else {
+                    editor.select(Some(item), false, window, cx);
+                }
             }))
     }
 
@@ -620,6 +717,13 @@ impl Editor {
                             )
                         }),
                 )
+        } else if !self.multi_selection.is_empty() {
+            let count = self.multi_selection.len();
+            let label = match self.graph.mode() {
+                ProjectMode::Ddd => format!("カード {count} 枚を選択中"),
+                ProjectMode::Free => format!("ノード {count} 件を選択中"),
+            };
+            pane.child(Label::new(label).font_weight(FontWeight::SEMIBOLD))
         } else {
             pane.child(Label::new("詳細").font_weight(FontWeight::SEMIBOLD))
                 .child(

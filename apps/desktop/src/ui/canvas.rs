@@ -1,4 +1,8 @@
-use std::{cell::Cell, collections::BTreeMap, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
 use gpui_kit::{
     component::{ActiveTheme, Disableable, Sizable, button::Button, label::Label},
@@ -7,7 +11,7 @@ use gpui_kit::{
 
 use crate::graph::{CardKind, Edge, Graph, Position, ProjectMode, card_label};
 
-use super::{Editor, Selection};
+use super::{Editor, Selection, alignment::MOVE_THRESHOLD};
 
 const NODE_WIDTH: f64 = 156.0;
 const NODE_HEIGHT: f64 = 44.0;
@@ -39,6 +43,10 @@ enum Drag {
         initial: Position,
         preview: Position,
         offset: Coord,
+    },
+    Select {
+        start: Coord,
+        end: Coord,
     },
 }
 
@@ -85,6 +93,21 @@ impl Viewport {
 
     pub(super) fn cancel_drag(&mut self) {
         self.drag = None;
+    }
+
+    pub(super) fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    fn selection_bounds(&self, start: Coord, end: Coord) -> Bounds<f64> {
+        let extent = self.bounds.get().size;
+        let limit = coord(point(extent.width, extent.height));
+        let clamp = |position: Coord| position.clamp(&point(0.0, 0.0), &limit);
+        let (start, end) = (clamp(start), clamp(end));
+        Bounds::from_corners(
+            point(start.x.min(end.x), start.y.min(end.y)),
+            point(start.x.max(end.x), start.y.max(end.y)),
+        )
     }
 
     fn local(&self, p: Point<Pixels>) -> Coord {
@@ -145,6 +168,7 @@ impl Editor {
             .min_h_0()
             .flex()
             .flex_col()
+            .child(self.alignment_toolbar(cx))
             .child(self.graph_canvas(cx))
             .children((self.graph.mode() == ProjectMode::Ddd).then(|| legend(cx)))
     }
@@ -160,28 +184,18 @@ impl Editor {
             .relative()
             .overflow_hidden()
             .bg(cx.theme().muted)
+            .track_focus(&self.canvas_focus)
+            .on_key_down(cx.listener(Self::canvas_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::canvas_down))
-            .on_mouse_move(cx.listener(|editor, event: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|editor, event: &MouseMoveEvent, window, cx| {
                 if event.dragging() {
                     editor.update_drag(event.position, cx);
                 } else if editor.viewport.drag.is_some() {
-                    editor.finish_drag(cx);
+                    editor.finish_drag(window, cx);
                 }
             }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|editor, event: &MouseUpEvent, _, cx| {
-                    editor.update_drag(event.position, cx);
-                    editor.finish_drag(cx);
-                }),
-            )
-            .on_mouse_up_out(
-                MouseButton::Left,
-                cx.listener(|editor, event: &MouseUpEvent, _, cx| {
-                    editor.update_drag(event.position, cx);
-                    editor.finish_drag(cx);
-                }),
-            )
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::canvas_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::canvas_up))
             .on_scroll(cx.listener(|editor, event: &ScrollEvent, _, cx| {
                 let delta = f64::from(f32::from(event.delta.pixel_delta(px(32.)).y));
                 editor.zoom_at(
@@ -273,31 +287,73 @@ impl Editor {
         }
         let item = self.viewport.hit(event.position, &self.graph, window);
         let start = self.viewport.local(event.position);
-        if item.is_none() {
-            self.viewport.drag = Some(Drag::Pan {
+        let shift = event.modifiers.shift;
+        self.viewport.drag = match item {
+            None if shift => Some(Drag::Select { start, end: start }),
+            None => Some(Drag::Pan {
                 start,
                 pan: self.viewport.transform.pan,
-            });
-            // Keep the inspector available while exploring the canvas.
-        } else if self.select(item, false, window, cx) {
-            if let Some(Selection::Node(id)) = item {
-                let initial = self.graph.positions()[&id];
-                let offset = point(initial.x, initial.y) - self.viewport.transform.unproject(start);
-                self.viewport.drag = Some(Drag::Node {
-                    initial,
-                    preview: initial,
-                    offset,
-                });
+            }),
+            Some(Selection::Node(id)) if shift => {
+                if !self.toggle_card(id, window, cx) {
+                    return;
+                }
+                None
             }
-            self.focus.focus(window, cx);
-        }
+            Some(item) => {
+                if !self.select(Some(item), false, window, cx) {
+                    return;
+                }
+                if let Selection::Node(id) = item {
+                    let initial = self.graph.positions()[&id];
+                    let offset =
+                        point(initial.x, initial.y) - self.viewport.transform.unproject(start);
+                    Some(Drag::Node {
+                        initial,
+                        preview: initial,
+                        offset,
+                    })
+                } else {
+                    None
+                }
+            }
+        };
+        self.canvas_focus.focus(window, cx);
         cx.notify();
+    }
+
+    fn canvas_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key != "escape" || self.busy {
+            return;
+        }
+        match self.viewport.drag {
+            Some(Drag::Select { .. }) => {
+                self.viewport.cancel_drag();
+                cx.notify();
+            }
+            None => {
+                self.select(None, false, window, cx);
+            }
+            _ => return,
+        }
+        cx.stop_propagation();
+    }
+
+    fn canvas_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.update_drag(event.position, cx);
+        self.finish_drag(window, cx);
     }
 
     fn update_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let local = self.viewport.local(position);
         match &mut self.viewport.drag {
             Some(Drag::Pan { start, pan }) => self.viewport.transform.pan = *pan + local - *start,
+            Some(Drag::Select { end, .. }) => *end = local,
             Some(Drag::Node {
                 initial,
                 preview,
@@ -315,21 +371,55 @@ impl Editor {
         cx.notify();
     }
 
-    fn finish_drag(&mut self, cx: &mut Context<Self>) {
-        if let Some(Drag::Node {
-            initial, preview, ..
-        }) = self.viewport.drag.take()
-            && (preview.x - initial.x).hypot(preview.y - initial.y) > 0.001
-        {
-            match self.graph.put_position(preview) {
-                Ok(()) => {
-                    self.dirty = true;
-                    self.status = None;
+    fn finish_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.viewport.drag.take() {
+            Some(Drag::Node {
+                initial, preview, ..
+            }) if (preview.x - initial.x).hypot(preview.y - initial.y) > MOVE_THRESHOLD => {
+                match self.graph.put_position(preview) {
+                    Ok(()) => {
+                        self.invalidate_alignment(preview.node_id);
+                        self.refresh_positions_dirty();
+                        self.status = None;
+                    }
+                    Err(error) => self.show_error(format!("{error:#}"), cx),
                 }
-                Err(error) => self.show_error(format!("{error:#}"), cx),
             }
+            Some(Drag::Select { start, end }) => self.finish_range(start, end, window, cx),
+            None => return,
+            _ => {}
         }
         cx.notify();
+    }
+
+    fn finish_range(
+        &mut self,
+        start: Coord,
+        end: Coord,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = self.viewport.selection_bounds(start, end);
+        let transform = self.viewport.transform;
+        let top_left = transform.unproject(bounds.origin);
+        let bottom_right = transform.unproject(bounds.bottom_right());
+        let half = node_half_size(self.graph.mode());
+        let mut cards: BTreeSet<_> = self.selected_cards().collect();
+        let previous_count = cards.len();
+        cards.extend(self.graph.positions().values().filter_map(|position| {
+            let left = position.x - half.x;
+            let right = position.x + half.x;
+            let top = position.y - half.y;
+            let bottom = position.y + half.y;
+            (left >= top_left.x
+                && right <= bottom_right.x
+                && top >= top_left.y
+                && bottom <= bottom_right.y)
+                .then_some(position.node_id)
+        }));
+        if cards.len() != previous_count {
+            self.select_cards(cards, window, cx);
+        }
     }
 }
 
@@ -338,6 +428,7 @@ struct Scene {
     transform: Transform,
     nodes: Vec<CanvasNode>,
     edges: Vec<CanvasEdge>,
+    selection_box: Option<Bounds<f64>>,
 }
 
 struct CanvasNode {
@@ -382,7 +473,7 @@ impl Scene {
                         center,
                         name,
                         kind: node.event_storming_kind,
-                        selected: editor.selection() == Some(Selection::Node(node.id)),
+                        selected: editor.is_selected(Selection::Node(node.id)),
                     })
                 } else {
                     None
@@ -404,6 +495,10 @@ impl Scene {
             transform,
             nodes,
             edges,
+            selection_box: match viewport.drag {
+                Some(Drag::Select { start, end }) => Some(viewport.selection_bounds(start, end)),
+                _ => None,
+            },
         }
     }
 }
@@ -550,7 +645,7 @@ fn edge_curves<'a>(graph: &'a Graph, viewport: &Viewport) -> Vec<(&'a Edge, Curv
     curves
 }
 
-fn node_half_size(mode: ProjectMode) -> Coord {
+pub(super) fn node_half_size(mode: ProjectMode) -> Coord {
     let height = match mode {
         ProjectMode::Free => NODE_HEIGHT,
         ProjectMode::Ddd => CARD_HEIGHT,
@@ -724,6 +819,19 @@ fn draw_scene(scene: &Scene, bounds: Bounds<Pixels>, window: &mut Window, cx: &m
                 }
             }
         }
+        if let Some(selection) = scene.selection_box {
+            window.paint_quad(quad(
+                Bounds::from_corners(
+                    origin + pixel(selection.origin),
+                    origin + pixel(selection.bottom_right()),
+                ),
+                px(0.),
+                selected_color.opacity(0.12),
+                px(1.),
+                selected_color,
+                BorderStyle::Solid,
+            ));
+        }
     });
 }
 
@@ -889,6 +997,251 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    async fn selects_aligns_and_undoes_cards_through_the_canvas_and_save(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::time::Duration;
+
+        use gpui_kit::{
+            AppContext, Bounds, InputEvent, Modifiers, MouseButton, MouseDownEvent, MouseMoveEvent,
+            MouseUpEvent, SharedString, WindowBounds, WindowOptions, px, size,
+            test::{TestAppContextExt, TestWindowExt},
+        };
+        use uuid::Uuid;
+
+        use super::{Editor, Scene, pixel};
+        use crate::{
+            graph::{CardKind, Graph, Node, Position},
+            project::ProjectFile,
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("alignment.lbproj");
+        let ids = [1, 2, 3, 4].map(Uuid::from_u128);
+        let original = Graph::from_records(
+            ProjectMode::Ddd,
+            ids.into_iter()
+                .zip(["注文する", "注文", "注文された", "キャンセルされた"])
+                .map(|(id, name)| Node {
+                    id,
+                    name: name.into(),
+                    kind: None,
+                    description: None,
+                    source_reference: None,
+                    event_storming_kind: Some(CardKind::DomainEvent),
+                })
+                .collect(),
+            vec![],
+            ids.into_iter()
+                .zip([
+                    (140.0, 140.0),
+                    (300.0, 260.0),
+                    (530.0, 360.0),
+                    (540.0, 458.0),
+                ])
+                .map(|(node_id, (x, y))| Position { node_id, x, y })
+                .collect(),
+        )
+        .unwrap();
+        drop(ProjectFile::create(&path, &original).unwrap());
+        let (window, editor) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(1440.), px(840.)),
+                ))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |_, cx| {
+                let focus = cx.focus_handle();
+                cx.new(|cx| Editor::new(focus, cx))
+            })
+            .unwrap()
+        });
+        let timeout = Duration::from_secs(4);
+        let click = |cx: &mut gpui_kit::TestAppContext, id: &'static str| {
+            cx.update(|cx| {
+                window
+                    .update(cx, |_, window, cx| window.click(id, cx))
+                    .unwrap()
+            });
+            cx.run_until_parked();
+        };
+        let open = |cx: &mut gpui_kit::TestAppContext| {
+            click(cx, "開く");
+            cx.simulate_path_prompt_response(|_| Some(vec![path.clone()]));
+        };
+        let choose_alignment = |cx: &mut gpui_kit::TestAppContext, steps| {
+            cx.update(|cx| {
+                window
+                    .update(cx, |_, window, cx| {
+                        window.click("align-cards", cx);
+                        assert!(window.try_find("popup-menu").is_some());
+                        for _ in 0..steps {
+                            window.press("down", cx);
+                        }
+                        window.press("enter", cx);
+                    })
+                    .unwrap()
+            });
+            cx.run_until_parked();
+            cx.update(|cx| {
+                window
+                    .update(cx, |_, window, cx| {
+                        window.render_frame(cx);
+                        assert!(window.try_find("popup-menu").is_none());
+                    })
+                    .unwrap()
+            });
+        };
+        open(cx);
+        cx.wait_for(window, timeout, |_, cx| {
+            editor.read(cx).project.is_some() && !editor.read(cx).busy
+        })
+        .await;
+
+        cx.update(|cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    let row = |id| SharedString::from(format!("node-{id}"));
+                    let shift = Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    };
+                    window.click("add-node", cx);
+                    window.input("編集中", cx);
+                    window.click_with_modifiers(row(ids[0]), shift, cx);
+                    assert_eq!(editor.read(cx).selected_card_count(), 0);
+                    assert!(editor.read(cx).error.as_ref().unwrap().contains("反映"));
+                    window.click("revert", cx);
+                    window.click(row(ids[0]), cx);
+                    window.click_with_modifiers(row(ids[1]), shift, cx);
+                    assert_eq!(
+                        editor.read(cx).selected_cards().collect::<Vec<_>>(),
+                        ids[..2]
+                    );
+                    assert!(editor.read(cx).form.is_none());
+                    window.click_with_modifiers(row(ids[1]), shift, cx);
+                    assert_eq!(editor.read(cx).single_card(), Some(ids[0]));
+                    assert!(editor.read(cx).form.is_some());
+
+                    window.click("zoom-in", cx);
+                    let viewport = &editor.read(cx).viewport;
+                    assert!(viewport.transform.scale > 1.0);
+                    let to_screen = |world| {
+                        viewport.bounds.get().origin + pixel(viewport.transform.project(world))
+                    };
+                    let start = to_screen(point(200.0, 432.0));
+                    let end = to_screen(point(633.0, 206.0));
+                    for cancel in [true, false] {
+                        window.dispatch_event(
+                            MouseDownEvent {
+                                button: MouseButton::Left,
+                                position: start,
+                                modifiers: shift,
+                                click_count: 1,
+                                ..Default::default()
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            MouseMoveEvent {
+                                pressed_button: Some(MouseButton::Left),
+                                position: end,
+                                modifiers: shift,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                        let state = editor.read(cx);
+                        assert!(
+                            Scene::new(state, state.viewport.bounds.get())
+                                .selection_box
+                                .is_some()
+                        );
+                        if cancel {
+                            window.press("escape", cx);
+                        }
+                        window.dispatch_event(
+                            MouseUpEvent {
+                                button: MouseButton::Left,
+                                position: end,
+                                modifiers: shift,
+                                click_count: 1,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                        window.render_frame(cx);
+                        let state = editor.read(cx);
+                        assert_eq!(state.selected_card_count(), if cancel { 1 } else { 3 });
+                        assert!(!state.has_changes(cx));
+                    }
+                    assert_eq!(
+                        editor.read(cx).selected_cards().collect::<Vec<_>>(),
+                        ids[..3]
+                    );
+                })
+                .unwrap()
+        });
+
+        choose_alignment(cx, 4); // 上揃え
+        choose_alignment(cx, 4); // No-op must preserve the previous undo.
+        choose_alignment(cx, 9); // 整列を取り消す
+        cx.update(|cx| {
+            assert!(!editor.read(cx).has_changes(cx));
+            assert_eq!(editor.read(cx).graph, original);
+        });
+        choose_alignment(cx, 4);
+        choose_alignment(cx, 7); // 横方向に等間隔
+        let arranged = cx.update(|cx| {
+            let state = editor.read(cx);
+            assert!(state.has_changes(cx));
+            for (&id, x) in ids[..3].iter().zip([140.0, 335.0, 530.0]) {
+                assert_eq!(
+                    state.graph.positions()[&id],
+                    Position {
+                        node_id: id,
+                        x,
+                        y: 140.0
+                    }
+                );
+            }
+            assert_eq!(
+                state.graph.positions()[&ids[3]],
+                original.positions()[&ids[3]]
+            );
+            state.graph.clone()
+        });
+        click(cx, "保存");
+        cx.wait_for(window, timeout, |_, cx| !editor.read(cx).busy)
+            .await;
+        cx.update(|cx| assert!(!editor.read(cx).has_changes(cx)));
+        choose_alignment(cx, 9);
+        cx.update(|cx| {
+            let state = editor.read(cx);
+            assert!(state.has_changes(cx));
+            assert_eq!(state.graph.positions()[&ids[1]].x, 300.0);
+            assert_eq!(state.graph.positions()[&ids[1]].y, 140.0);
+        });
+        click(cx, "開く");
+        cx.simulate_prompt_answer("破棄");
+        cx.run_until_parked();
+        cx.simulate_path_prompt_response(|_| Some(vec![path.clone()]));
+        cx.wait_for(window, timeout, |_, cx| !editor.read(cx).busy)
+            .await;
+        cx.update(|cx| {
+            let state = editor.read(cx);
+            assert_eq!(state.graph, arranged);
+            assert_eq!(state.selected_card_count(), 0);
+            assert!(state.alignment_change.is_none());
+            assert!(!state.has_changes(cx));
+        });
+    }
+
+    #[gpui_kit::test]
     async fn edits_and_saves_a_japanese_graph_after_dragging_at_zoom(
         cx: &mut gpui_kit::TestAppContext,
     ) {
@@ -915,7 +1268,7 @@ mod tests {
                 ..Default::default()
             };
             gpui_kit::open_window(options, cx, |_, cx| {
-                let mut editor = Editor::new(cx.focus_handle());
+                let mut editor = Editor::new(cx.focus_handle(), cx);
                 editor.project = Some(project.clone());
                 cx.new(|_| editor)
             })
@@ -1028,7 +1381,7 @@ mod tests {
             };
             gpui_kit::open_window(options, cx, |_, cx| {
                 let focus = cx.focus_handle();
-                cx.new(|_| Editor::new(focus))
+                cx.new(|cx| Editor::new(focus, cx))
             })
             .unwrap()
         });
