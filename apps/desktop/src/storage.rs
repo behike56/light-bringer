@@ -2,20 +2,23 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, Row, Transaction, TransactionBehavior, params};
+use serde::de::{DeserializeOwned, value::StringDeserializer};
+#[cfg(test)]
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
-use crate::graph::{Edge, Graph, Node, Position};
+use crate::graph::{CardKind, DddRelation, Edge, Graph, Node, Position, ProjectMode};
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const APPLICATION_ID: i32 = i32::from_be_bytes(*b"LBGR");
 
-const SCHEMA: &str = "
+const SCHEMA_V1: &str = "
     CREATE TABLE nodes (
         id TEXT PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
@@ -40,13 +43,24 @@ const SCHEMA: &str = "
     ) STRICT;
 ";
 
-pub struct ProjectFile {
+const MIGRATE_TO_V2: &str = "
+    ALTER TABLE nodes ADD COLUMN event_storming_kind TEXT;
+    ALTER TABLE edges ADD COLUMN event_storming_relation TEXT;
+    CREATE TABLE project_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        mode TEXT NOT NULL
+    ) STRICT;
+";
+
+pub struct SqliteProject {
     path: PathBuf,
     file: File,
     _session_lock: File,
+    needs_upgrade: AtomicBool,
 }
 
-impl ProjectFile {
+impl SqliteProject {
+    #[cfg(test)]
     pub fn create(path: &Path, graph: &Graph) -> Result<Self> {
         let parent = path.parent().context("保存先のフォルダがありません")?;
         let parent = parent
@@ -55,15 +69,7 @@ impl ProjectFile {
         let path = parent.join(path.file_name().context("ファイル名がありません")?);
         let temp = NamedTempFile::new_in(parent).context("プロジェクトを作成できません")?;
         let session_lock = lock_session(temp.as_file())?;
-        {
-            let mut connection = connect(temp.path())?;
-            let transaction = connection.transaction()?;
-            transaction.execute_batch(SCHEMA)?;
-            transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            insert_graph(&transaction, graph)?;
-            transaction.commit()?;
-        }
+        initialize(connect(temp.path())?, graph)?;
         let file = temp.persist_noclobber(&path).context(
             "プロジェクトを作成できません。保存先に同名ファイルがないか確認してください",
         )?;
@@ -71,6 +77,7 @@ impl ProjectFile {
             path,
             file,
             _session_lock: session_lock,
+            needs_upgrade: AtomicBool::new(false),
         })
     }
 
@@ -88,8 +95,9 @@ impl ProjectFile {
             path,
             file,
             _session_lock: session_lock,
+            needs_upgrade: AtomicBool::new(false),
         };
-        let graph = project.read()?;
+        let graph = project.reload()?;
         Ok((project, graph))
     }
 
@@ -105,58 +113,37 @@ impl ProjectFile {
     }
 
     pub fn read(&self) -> Result<Graph> {
+        self.read_versioned().map(|(_, graph)| graph)
+    }
+
+    pub fn reload(&self) -> Result<Graph> {
+        let (version, graph) = self.read_versioned()?;
+        self.needs_upgrade.store(version == 1, Ordering::Relaxed);
+        Ok(graph)
+    }
+
+    pub fn needs_upgrade(&self) -> bool {
+        self.needs_upgrade.load(Ordering::Relaxed)
+    }
+
+    fn read_versioned(&self) -> Result<(u32, Graph)> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction()?;
-        check_version(&transaction)?;
-        let nodes = read_rows(
-            &transaction,
-            "SELECT id, name, kind, description, source_reference FROM nodes",
-            |row| {
-                Ok(Node {
-                    id: id_column(row, 0)?,
-                    name: row.get(1)?,
-                    kind: row.get(2)?,
-                    description: row.get(3)?,
-                    source_reference: row.get(4)?,
-                })
-            },
-        )?;
-        let edges = read_rows(
-            &transaction,
-            "SELECT id, source_id, target_id, label, note, source_reference FROM edges",
-            |row| {
-                Ok(Edge {
-                    id: id_column(row, 0)?,
-                    source_id: id_column(row, 1)?,
-                    target_id: id_column(row, 2)?,
-                    label: row.get(3)?,
-                    note: row.get(4)?,
-                    source_reference: row.get(5)?,
-                })
-            },
-        )?;
-        let positions = read_rows(
-            &transaction,
-            "SELECT node_id, x, y FROM node_positions",
-            |row| {
-                Ok(Position {
-                    node_id: id_column(row, 0)?,
-                    x: row.get(1)?,
-                    y: row.get(2)?,
-                })
-            },
-        )?;
-        Graph::from_records(nodes, edges, positions).context("保存済みグラフの検証に失敗しました")
+        let version = check_version(&transaction)?;
+        Ok((version, read_graph(&transaction, version)?))
     }
 
     pub fn save(&self, graph: &Graph) -> Result<()> {
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        check_version(&transaction)?;
+        if check_version(&transaction)? == 1 {
+            migrate_to_v2(&transaction)?;
+        }
         // Foreign-key cascades remove the old edges and positions in the same transaction.
         transaction.execute("DELETE FROM nodes", [])?;
         insert_graph(&transaction, graph)?;
         transaction.commit()?;
+        self.needs_upgrade.store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -234,33 +221,147 @@ fn connect(path: &Path) -> Result<Connection> {
     Ok(connection)
 }
 
-fn check_version(connection: &Connection) -> Result<()> {
+pub fn write_snapshot(path: &Path, graph: &Graph) -> Result<()> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    initialize(connection, graph)
+}
+
+pub fn read_snapshot(path: &Path) -> Result<(u32, Graph)> {
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.pragma_update(None, "trusted_schema", false)?;
+    let transaction = connection.transaction()?;
+    let version = check_version(&transaction)?;
+    let check: String = transaction.pragma_query_value(None, "quick_check", |row| row.get(0))?;
+    ensure!(
+        check == "ok",
+        "SQLite の整合性検査に失敗しました（{check}）"
+    );
+    let tables = ["nodes", "edges", "node_positions", "project_settings"];
+    for table in &tables[..if version == 1 { 3 } else { 4 }] {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_list
+                           WHERE schema = 'main' AND name = ?1 AND type = 'table' AND strict = 1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        ensure!(exists, "SQLite にテーブル {table} がありません");
+    }
+    Ok((version, read_graph(&transaction, version)?))
+}
+
+fn initialize(mut connection: Connection, graph: &Graph) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(SCHEMA_V1)?;
+    transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+    migrate_to_v2(&transaction)?;
+    insert_graph(&transaction, graph)?;
+    transaction.commit()?;
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(())
+}
+
+fn migrate_to_v2(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(MIGRATE_TO_V2)?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+fn read_graph(connection: &Connection, version: u32) -> Result<Graph> {
+    let (mode, kind, relation) = if version == 1 {
+        (ProjectMode::Free, "NULL", "NULL")
+    } else {
+        let settings = read_rows(connection, "SELECT id, mode FROM project_settings", |row| {
+            Ok((row.get::<_, i64>(0)?, enum_column(row, 1)?))
+        })
+        .context("project_settings の読み込みに失敗しました")?;
+        let [(1, Some(mode))] = settings.as_slice() else {
+            bail!("project_settings には mode を指定した設定が1件必要です");
+        };
+        (*mode, "event_storming_kind", "event_storming_relation")
+    };
+    let nodes = read_rows(
+        connection,
+        &format!("SELECT id, name, kind, description, source_reference, {kind} FROM nodes"),
+        |row| {
+            Ok(Node {
+                id: id_column(row, 0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+                description: row.get(3)?,
+                source_reference: row.get(4)?,
+                event_storming_kind: enum_column(row, 5)?,
+            })
+        },
+    )?;
+    let edges = read_rows(
+        connection,
+        &format!(
+            "SELECT id, source_id, target_id, label, note, source_reference, {relation} FROM edges"
+        ),
+        |row| {
+            Ok(Edge {
+                id: id_column(row, 0)?,
+                source_id: id_column(row, 1)?,
+                target_id: id_column(row, 2)?,
+                label: row.get(3)?,
+                note: row.get(4)?,
+                source_reference: row.get(5)?,
+                event_storming_relation: enum_column(row, 6)?,
+            })
+        },
+    )?;
+    let positions = read_rows(
+        connection,
+        "SELECT node_id, x, y FROM node_positions",
+        |row| {
+            Ok(Position {
+                node_id: id_column(row, 0)?,
+                x: row.get(1)?,
+                y: row.get(2)?,
+            })
+        },
+    )?;
+    Graph::from_records(mode, nodes, edges, positions).context("保存済みグラフの検証に失敗しました")
+}
+
+fn check_version(connection: &Connection) -> Result<u32> {
     let id: i32 = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
-    let version: i32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     ensure!(
         id == APPLICATION_ID,
         "Light Bringer のプロジェクトファイルを選んでください"
     );
     ensure!(
-        version == SCHEMA_VERSION,
+        version == 1 || version == i64::from(SCHEMA_VERSION),
         "未対応のプロジェクトバージョンです（{version}）"
     );
-    Ok(())
+    Ok(version as u32)
 }
 
 fn insert_graph(transaction: &Transaction<'_>, graph: &Graph) -> Result<()> {
-    let mut insert_node = transaction.prepare("INSERT INTO nodes VALUES (?1, ?2, ?3, ?4, ?5)")?;
+    transaction.execute(
+        "INSERT INTO project_settings (id, mode) VALUES (1, ?1)
+         ON CONFLICT (id) DO UPDATE SET mode = excluded.mode",
+        [graph.mode().key()],
+    )?;
+    let mut insert_node =
+        transaction.prepare("INSERT INTO nodes VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
     for node in graph.nodes().values() {
         insert_node.execute(params![
             node.id.to_string(),
             node.name,
             node.kind,
             node.description,
-            node.source_reference
+            node.source_reference,
+            node.event_storming_kind.map(CardKind::key)
         ])?;
     }
     let mut insert_edge =
-        transaction.prepare("INSERT INTO edges VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+        transaction.prepare("INSERT INTO edges VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
     for edge in graph.edges().values() {
         insert_edge.execute(params![
             edge.id.to_string(),
@@ -268,7 +369,8 @@ fn insert_graph(transaction: &Transaction<'_>, graph: &Graph) -> Result<()> {
             edge.target_id.to_string(),
             edge.label,
             edge.note,
-            edge.source_reference
+            edge.source_reference,
+            edge.event_storming_relation.map(DddRelation::key)
         ])?;
     }
     let mut insert_position =
@@ -304,4 +406,20 @@ fn id_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Uuid> {
             Box::new(error),
         )
     })
+}
+
+fn enum_column<T: DeserializeOwned>(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<T>> {
+    row.get::<_, Option<String>>(index)?
+        .map(|value| {
+            T::deserialize(StringDeserializer::<serde::de::value::Error>::new(value)).map_err(
+                |error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                },
+            )
+        })
+        .transpose()
 }

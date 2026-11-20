@@ -1,11 +1,16 @@
+mod event_storming;
+
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use event_storming::{CardKind, DddRelation, ProjectMode, card_label};
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Graph {
+    mode: ProjectMode,
     nodes: BTreeMap<Uuid, Node>,
     edges: BTreeMap<Uuid, Edge>,
     positions: BTreeMap<Uuid, Position>,
@@ -21,6 +26,8 @@ pub struct Node {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_storming_kind: Option<CardKind>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -33,6 +40,8 @@ pub struct Edge {
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_storming_relation: Option<DddRelation>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -43,12 +52,20 @@ pub struct Position {
 }
 
 impl Graph {
+    pub fn new(mode: ProjectMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
     pub fn from_records(
+        mode: ProjectMode,
         nodes: Vec<Node>,
         edges: Vec<Edge>,
         positions: Vec<Position>,
     ) -> Result<Self> {
-        let mut graph = Self::default();
+        let mut graph = Self::new(mode);
         let mut errors = Vec::new();
         let mut seen = HashSet::new();
 
@@ -74,6 +91,21 @@ impl Graph {
         Ok(graph)
     }
 
+    pub fn mode(&self) -> ProjectMode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: ProjectMode) {
+        self.mode = mode;
+    }
+
+    pub fn relation_for(&self, source: Uuid, target: Uuid) -> Option<DddRelation> {
+        DddRelation::for_ends(
+            self.nodes.get(&source)?.event_storming_kind,
+            self.nodes.get(&target)?.event_storming_kind,
+        )
+    }
+
     pub fn nodes(&self) -> &BTreeMap<Uuid, Node> {
         &self.nodes
     }
@@ -88,6 +120,35 @@ impl Graph {
 
     pub fn put_node(&mut self, mut node: Node) -> Result<()> {
         node.name = required_name(&node.name, "name", "ノード名")?;
+        if self
+            .nodes
+            .get(&node.id)
+            .is_some_and(|previous| previous.event_storming_kind != node.event_storming_kind)
+        {
+            let kind_at = |id| {
+                if id == node.id {
+                    node.event_storming_kind
+                } else {
+                    self.nodes[&id].event_storming_kind
+                }
+            };
+            let errors: Vec<_> = self
+                .edges
+                .values()
+                .filter(|edge| connects(edge, node.id))
+                .filter_map(|edge| {
+                    validate_relation(edge, kind_at(edge.source_id), kind_at(edge.target_id))
+                        .err()
+                        .map(|error| error.to_string())
+                })
+                .collect();
+            if !errors.is_empty() {
+                bail!(
+                    "カード種別を変更するには、先に次の関係を編集または削除してください。\n{}",
+                    errors.join("\n")
+                );
+            }
+        }
         self.nodes.insert(node.id, node);
         Ok(())
     }
@@ -104,6 +165,11 @@ impl Graph {
             "target_id {} のノードがありません",
             edge.target_id
         );
+        validate_relation(
+            &edge,
+            self.nodes[&edge.source_id].event_storming_kind,
+            self.nodes[&edge.target_id].event_storming_kind,
+        )?;
         self.edges.insert(edge.id, edge);
         Ok(())
     }
@@ -146,14 +212,17 @@ impl Graph {
         const COLUMNS: usize = 4;
         const FIRST_X: f64 = 110.0;
         const FIRST_Y: f64 = 100.0;
-        const STEP_X: f64 = 190.0;
         const STEP_Y: f64 = 115.0;
+        let step_x = match self.mode {
+            ProjectMode::Free => 190.0,
+            ProjectMode::Ddd => 280.0,
+        };
         let mut occupied = HashSet::new();
         for position in self.positions.values() {
             let row = ((position.y - FIRST_Y) / STEP_Y).round();
             if row >= 0.0 && (position.y - (FIRST_Y + row * STEP_Y)).abs() < 55.0 {
                 for column in 0..COLUMNS {
-                    if (position.x - (FIRST_X + column as f64 * STEP_X)).abs() < 170.0 {
+                    if (position.x - (FIRST_X + column as f64 * step_x)).abs() < 170.0 {
                         occupied.insert((column, row as usize));
                     }
                 }
@@ -168,12 +237,31 @@ impl Graph {
             while occupied.contains(&(slot % COLUMNS, slot / COLUMNS)) {
                 slot += 1;
             }
-            let x = FIRST_X + (slot % COLUMNS) as f64 * STEP_X;
+            let x = FIRST_X + (slot % COLUMNS) as f64 * step_x;
             let y = FIRST_Y + (slot / COLUMNS) as f64 * STEP_Y;
             self.positions.insert(*id, Position { node_id: *id, x, y });
             slot += 1;
         }
     }
+}
+
+fn validate_relation(
+    edge: &Edge,
+    source: Option<CardKind>,
+    target: Option<CardKind>,
+) -> Result<()> {
+    if let Some(relation) = edge.event_storming_relation {
+        ensure!(
+            Some(relation) == DddRelation::for_ends(source, target),
+            "関係「{}」（{}）の event_storming_relation {} は「{} → {}」で使えません",
+            edge.label,
+            edge.id,
+            relation.key(),
+            card_label(source),
+            card_label(target),
+        );
+    }
+    Ok(())
 }
 
 fn required_name(value: &str, field: &str, label: &str) -> Result<String> {

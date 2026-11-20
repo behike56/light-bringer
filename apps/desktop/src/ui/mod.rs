@@ -17,7 +17,10 @@ use gpui_kit::{
 };
 use uuid::Uuid;
 
-use crate::{graph::Graph, storage::ProjectFile};
+use crate::{
+    graph::{Graph, ProjectMode, card_label},
+    project::ProjectFile,
+};
 
 use self::{canvas::Viewport, files::Command, form::Form};
 
@@ -27,8 +30,10 @@ gpui_kit::actions!(
         NewProject,
         OpenProject,
         SaveProject,
+        SaveProjectAs,
         ImportJson,
         ExportJson,
+        CloseProject,
         Quit,
         CloseWindow
     ]
@@ -62,6 +67,7 @@ pub fn run() {
                 KeyBinding::new("cmd-n", NewProject, None),
                 KeyBinding::new("cmd-o", OpenProject, None),
                 KeyBinding::new("cmd-s", SaveProject, None),
+                KeyBinding::new("cmd-shift-s", SaveProjectAs, None),
                 KeyBinding::new("cmd-w", CloseWindow, None),
                 KeyBinding::new("cmd-q", Quit, None),
             ]);
@@ -71,10 +77,12 @@ pub fn run() {
                     MenuItem::action("新規プロジェクト…", NewProject),
                     MenuItem::action("開く…", OpenProject),
                     MenuItem::action("保存", SaveProject),
+                    MenuItem::action("別名で保存…", SaveProjectAs),
                     MenuItem::separator(),
                     MenuItem::action("JSON を取り込む…", ImportJson),
                     MenuItem::action("JSON を書き出す…", ExportJson),
                     MenuItem::separator(),
+                    MenuItem::action("プロジェクトを閉じる", CloseProject),
                     MenuItem::action("ウィンドウを閉じる", CloseWindow),
                 ]),
                 Menu::new("編集").items([
@@ -156,6 +164,12 @@ impl Editor {
         self.dirty || self.form.as_ref().is_some_and(|form| form.dirty(cx))
     }
 
+    fn can_save(&self, cx: &App) -> bool {
+        self.project
+            .as_ref()
+            .is_some_and(|project| self.has_changes(cx) || project.needs_upgrade())
+    }
+
     fn select(
         &mut self,
         selection: Option<Selection>,
@@ -208,6 +222,28 @@ impl Editor {
             .as_ref()
             .filter(|form| form.exists())
             .map(|form| Form::new(form.selection, &self.graph, None, window, cx));
+        self.error = None;
+        cx.notify();
+    }
+
+    fn switch_mode(&mut self, mode: ProjectMode, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.project.is_none() || self.graph.mode() == mode {
+            return;
+        }
+        if self.form.as_ref().is_some_and(|form| form.dirty(cx)) {
+            self.show_error(
+                "モードを切り替えるには、詳細フォームの入力を反映するか、取り消してください",
+                cx,
+            );
+            return;
+        }
+        self.viewport.cancel_drag();
+        self.graph.set_mode(mode);
+        self.form = self
+            .selection()
+            .map(|item| Form::new(item, &self.graph, None, window, cx));
+        self.dirty = true;
+        self.status = None;
         self.error = None;
         cx.notify();
     }
@@ -273,6 +309,12 @@ impl Editor {
     fn toolbar(&self, cx: &Context<Self>) -> impl IntoElement {
         let has_project = self.project.is_some();
         let disabled = self.busy;
+        let can_save = !disabled && self.can_save(cx);
+        let mode = self.graph.mode();
+        let next_mode = match mode {
+            ProjectMode::Free => ProjectMode::Ddd,
+            ProjectMode::Ddd => ProjectMode::Free,
+        };
         let name = self
             .project
             .as_ref()
@@ -296,13 +338,27 @@ impl Editor {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(name),
             )
+            .when(has_project, |toolbar| {
+                toolbar.child(
+                    Button::new("switch-mode")
+                        .label(format!("{} ⇄", mode.label()))
+                        .tooltip(format!("{}に切り替え", next_mode.label()))
+                        .small()
+                        .outline()
+                        .disabled(disabled)
+                        .on_click(cx.listener(move |editor, _, window, cx| {
+                            editor.switch_mode(next_mode, window, cx);
+                        })),
+                )
+            })
             .children(
                 [
                     (Command::New, "新規", false),
                     (Command::Open, "開く", false),
                     (Command::Import, "JSON 取込", false),
                     (Command::Export, "JSON 書出", !has_project),
-                    (Command::Save, "保存", !self.has_changes(cx)),
+                    (Command::Save, "保存", !can_save),
+                    (Command::SaveAs, "別名で保存", !has_project),
                 ]
                 .into_iter()
                 .map(|(command, label, unavailable)| {
@@ -324,6 +380,7 @@ impl Editor {
 
     fn sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
         let disabled = self.busy;
+        let ddd = self.graph.mode() == ProjectMode::Ddd;
         let mut nodes: Vec<_> = self.graph.nodes().values().collect();
         nodes.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         let mut edges: Vec<_> = self.graph.edges().values().collect();
@@ -345,8 +402,12 @@ impl Editor {
                     .justify_between()
                     .p_3()
                     .child(
-                        Label::new(format!("ノード {}", nodes.len()))
-                            .font_weight(FontWeight::SEMIBOLD),
+                        Label::new(format!(
+                            "{} {}",
+                            if ddd { "カード" } else { "ノード" },
+                            nodes.len()
+                        ))
+                        .font_weight(FontWeight::SEMIBOLD),
                     )
                     .child(
                         Button::new("add-node")
@@ -374,7 +435,12 @@ impl Editor {
                     .flex_col()
                     .gap_1()
                     .children(nodes.into_iter().map(|node| {
-                        let secondary = [node.kind.as_deref(), node.description.as_deref()]
+                        let kind = if ddd {
+                            Some(card_label(node.event_storming_kind))
+                        } else {
+                            node.kind.as_deref()
+                        };
+                        let secondary = [kind, node.description.as_deref()]
                             .into_iter()
                             .flatten()
                             .filter(|s| !s.is_empty())
@@ -450,6 +516,7 @@ impl Editor {
         let accent = cx.theme().accent;
         div()
             .id(SharedString::from(format!("{category}-{id}")))
+            .test_support()
             .flex_shrink_0()
             .rounded_md()
             .px_2()
@@ -493,11 +560,13 @@ impl Editor {
             .p_4()
             .gap_4();
         if let Some(form) = &self.form {
-            let title = match (form.selection, form.exists()) {
-                (Selection::Node(_), true) => "ノードの詳細",
-                (Selection::Node(_), false) => "ノードを追加",
-                (Selection::Edge(_), true) => "関係の詳細",
-                (Selection::Edge(_), false) => "関係を追加",
+            let title = match (form.selection, form.exists(), self.graph.mode()) {
+                (Selection::Node(_), true, ProjectMode::Ddd) => "カードの詳細",
+                (Selection::Node(_), false, ProjectMode::Ddd) => "カードを追加",
+                (Selection::Node(_), true, ProjectMode::Free) => "ノードの詳細",
+                (Selection::Node(_), false, ProjectMode::Free) => "ノードを追加",
+                (Selection::Edge(_), true, _) => "関係の詳細",
+                (Selection::Edge(_), false, _) => "関係を追加",
             };
             let disabled = self.busy || !form.dirty(cx);
             pane.child(Label::new(title).font_weight(FontWeight::SEMIBOLD))
@@ -506,7 +575,7 @@ impl Editor {
                         .id("inspector-form")
                         .min_h_0()
                         .flex_1()
-                        .child(form.render(self.busy, cx))
+                        .child(form.render(&self.graph, self.busy, cx))
                         .overflow_y_scrollbar(),
                 )
                 .child(
@@ -670,12 +739,20 @@ impl Render for Editor {
             .on_action(cx.listener(|editor, _: &SaveProject, window, cx| {
                 editor.command(Command::Save, window, cx)
             }))
+            .on_action(cx.listener(|editor, _: &SaveProjectAs, window, cx| {
+                editor.command(Command::SaveAs, window, cx)
+            }))
             .on_action(cx.listener(|editor, _: &ImportJson, window, cx| {
                 editor.command(Command::Import, window, cx)
             }))
             .on_action(cx.listener(|editor, _: &ExportJson, window, cx| {
                 editor.command(Command::Export, window, cx)
             }))
+            .when(self.project.is_some() && !self.busy, |root| {
+                root.on_action(cx.listener(|editor, _: &CloseProject, window, cx| {
+                    editor.command(Command::CloseProject, window, cx)
+                }))
+            })
             .on_action(
                 cx.listener(|editor, _: &Quit, window, cx| {
                     editor.command(Command::Quit, window, cx)

@@ -1,5 +1,6 @@
 mod exchange;
 mod graph;
+mod project;
 mod storage;
 mod ui;
 

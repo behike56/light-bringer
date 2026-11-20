@@ -5,12 +5,13 @@ use gpui_kit::{
     *,
 };
 
-use crate::graph::{Edge, Graph, Position};
+use crate::graph::{CardKind, Edge, Graph, Position, ProjectMode, card_label};
 
 use super::{Editor, Selection};
 
 const NODE_WIDTH: f64 = 156.0;
 const NODE_HEIGHT: f64 = 44.0;
+const CARD_HEIGHT: f64 = 78.0;
 const ZOOM_MIN: f64 = 0.2;
 const ZOOM_MAX: f64 = 3.0;
 
@@ -99,31 +100,62 @@ impl Viewport {
         }
     }
 
-    fn hit(&self, window_position: Point<Pixels>, graph: &Graph) -> Option<Selection> {
+    fn hit(
+        &self,
+        window_position: Point<Pixels>,
+        graph: &Graph,
+        window: &Window,
+    ) -> Option<Selection> {
         let local = self.local(window_position);
         let world = self.transform.unproject(local);
+        let half = node_half_size(graph.mode());
         if let Some(position) = graph.positions().values().rev().find(|position| {
             let delta = self.position(position) - world;
-            delta.x.abs() <= NODE_WIDTH / 2.0 && delta.y.abs() <= NODE_HEIGHT / 2.0
+            delta.x.abs() <= half.x && delta.y.abs() <= half.y
         }) {
             return Some(Selection::Node(position.node_id));
         }
 
-        edge_curves(graph, self)
-            .into_iter()
-            .rev()
-            .find(|(_, curve)| curve.hit(local))
+        let curves = edge_curves(graph, self);
+        let label = curves.iter().rev().find(|(edge, curve)| {
+            let delta = curve.label() - local;
+            delta.x.abs() <= 87.5 && delta.y.abs() <= 9.0 && {
+                let width = shape(
+                    &caption(&edge.label),
+                    px(11.),
+                    black(),
+                    &window.text_style().font(),
+                    window,
+                )
+                .width();
+                label_bounds(pixel(curve.label()), width).contains(&pixel(local))
+            }
+        });
+        label
+            .or_else(|| curves.iter().rev().find(|(_, curve)| curve.hit(local)))
             .map(|(edge, _)| Selection::Edge(edge.id))
     }
 }
 
 impl Editor {
     pub(super) fn canvas(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(self.graph_canvas(cx))
+            .children((self.graph.mode() == ProjectMode::Ddd).then(|| legend(cx)))
+    }
+
+    fn graph_canvas(&self, cx: &Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let bounds = Rc::clone(&self.viewport.bounds);
         let percent = format!("{:.0}%", self.viewport.transform.scale * 100.0);
         div()
             .flex_1()
+            .min_h_0()
             .min_w_0()
             .relative()
             .overflow_hidden()
@@ -239,7 +271,7 @@ impl Editor {
         if self.busy {
             return;
         }
-        let item = self.viewport.hit(event.position, &self.graph);
+        let item = self.viewport.hit(event.position, &self.graph, window);
         let start = self.viewport.local(event.position);
         if item.is_none() {
             self.viewport.drag = Some(Drag::Pan {
@@ -302,14 +334,31 @@ impl Editor {
 }
 
 struct Scene {
+    mode: ProjectMode,
     transform: Transform,
-    nodes: Vec<(Coord, SharedString, bool)>,
-    edges: Vec<(Curve, SharedString, bool)>,
+    nodes: Vec<CanvasNode>,
+    edges: Vec<CanvasEdge>,
+}
+
+struct CanvasNode {
+    center: Coord,
+    name: SharedString,
+    kind: Option<CardKind>,
+    selected: bool,
+}
+
+struct CanvasEdge {
+    curve: Curve,
+    label: SharedString,
+    selected: bool,
+    dashed: bool,
 }
 
 impl Scene {
     fn new(editor: &Editor, bounds: Bounds<Pixels>) -> Self {
         let viewport = &editor.viewport;
+        let graph = &editor.graph;
+        let mode = graph.mode();
         let transform = viewport.transform;
         let extent = coord(point(bounds.size.width, bounds.size.height));
         let margin = 100.0 * transform.scale + 24.0;
@@ -324,26 +373,34 @@ impl Scene {
                     && center.y >= -margin
                     && center.y <= extent.y + margin
                 {
-                    let id = position.node_id;
-                    let selected = editor.selection() == Some(Selection::Node(id));
-                    Some((center, caption(&editor.graph.nodes()[&id].name), selected))
+                    let node = &graph.nodes()[&position.node_id];
+                    let name = match mode {
+                        ProjectMode::Free => caption(&node.name),
+                        ProjectMode::Ddd => node.name.chars().take(150).collect::<String>().into(),
+                    };
+                    Some(CanvasNode {
+                        center,
+                        name,
+                        kind: node.event_storming_kind,
+                        selected: editor.selection() == Some(Selection::Node(node.id)),
+                    })
                 } else {
                     None
                 }
             })
             .collect();
-        let edges = edge_curves(&editor.graph, viewport)
+        let edges = edge_curves(graph, viewport)
             .into_iter()
             .filter(|(_, curve)| curve.visible(extent))
-            .map(|(edge, curve)| {
-                (
-                    curve,
-                    caption(&edge.label),
-                    editor.selection() == Some(Selection::Edge(edge.id)),
-                )
+            .map(|(edge, curve)| CanvasEdge {
+                curve,
+                label: caption(&edge.label),
+                selected: editor.selection() == Some(Selection::Edge(edge.id)),
+                dashed: mode == ProjectMode::Ddd && edge.event_storming_relation.is_none(),
             })
             .collect();
         Self {
+            mode,
             transform,
             nodes,
             edges,
@@ -367,10 +424,6 @@ impl Curve {
     }
 
     fn hit(self, cursor: Coord) -> bool {
-        let label = self.label();
-        if (cursor.x - label.x).abs() < 20.0 && (cursor.y - label.y).abs() < 8.0 {
-            return true;
-        }
         let mut prev = self.0[0];
         for i in 1..=20 {
             let next = self.at(f64::from(i) / 20.0);
@@ -399,6 +452,45 @@ impl Curve {
             && !p.iter().all(|p| p.x > extent.x + margin)
             && !p.iter().all(|p| p.y > extent.y + margin)
     }
+
+    fn trace(self, path: &mut PathBuilder, origin: Point<Pixels>, dashed: bool) {
+        let [start, a, b, end] = self.0;
+        if !dashed {
+            path.move_to(origin + pixel(start));
+            path.cubic_bezier_to(origin + pixel(end), origin + pixel(a), origin + pixel(b));
+            return;
+        }
+
+        // Flatten the curve and carry the dash phase across segments.
+        let length_bound = self
+            .0
+            .windows(2)
+            .map(|pair| {
+                let delta = pair[1] - pair[0];
+                delta.x.hypot(delta.y)
+            })
+            .sum::<f64>();
+        let dash = 6.0_f64.max(length_bound / 1000.0);
+        let mut phase = 0.0;
+        let mut start = start;
+        for step in 1..=32 {
+            let end = self.at(f64::from(step) / 32.0);
+            let delta = end - start;
+            let length = delta.x.hypot(delta.y);
+            let mut offset = -phase;
+            while offset < length {
+                let from = offset.max(0.0);
+                let to = (offset + dash).min(length);
+                if to > from {
+                    path.move_to(origin + pixel(start + delta * (from / length)));
+                    path.line_to(origin + pixel(start + delta * (to / length)));
+                }
+                offset += 2.0 * dash;
+            }
+            phase = (phase + length) % (2.0 * dash);
+            start = end;
+        }
+    }
 }
 
 fn edge_curves<'a>(graph: &'a Graph, viewport: &Viewport) -> Vec<(&'a Edge, Curve)> {
@@ -412,6 +504,7 @@ fn edge_curves<'a>(graph: &'a Graph, viewport: &Viewport) -> Vec<(&'a Edge, Curv
     }
 
     let mut curves = Vec::with_capacity(graph.edges().len());
+    let half = node_half_size(graph.mode());
     for ((first, second), group) in groups {
         let first_pos = viewport.position(&graph.positions()[&first]);
         let second_pos = viewport.position(&graph.positions()[&second]);
@@ -422,10 +515,10 @@ fn edge_curves<'a>(graph: &'a Graph, viewport: &Viewport) -> Vec<(&'a Edge, Curv
             let world = if length < 0.001 {
                 let reach = 60.0 + index as f64 * 34.0;
                 [
-                    first_pos + point(17.0, -NODE_HEIGHT / 2.0),
-                    first_pos + point(36.0, -NODE_HEIGHT / 2.0 - reach),
-                    first_pos + point(NODE_WIDTH / 2.0 + reach, -35.0),
-                    first_pos + point(NODE_WIDTH / 2.0, 4.0),
+                    first_pos + point(17.0, -half.y),
+                    first_pos + point(36.0, -half.y - reach),
+                    first_pos + point(half.x + reach, -35.0),
+                    first_pos + point(half.x, 4.0),
                 ]
             } else {
                 let (source, target) = if edge.source_id == first {
@@ -437,7 +530,12 @@ fn edge_curves<'a>(graph: &'a Graph, viewport: &Viewport) -> Vec<(&'a Edge, Curv
                 let offset = normal * ((index as f64 - middle) * 48.0);
                 let a = source + (target - source) / 3.0 + offset;
                 let b = target + (source - target) / 3.0 + offset;
-                [node_boundary(source, a), a, b, node_boundary(target, b)]
+                [
+                    node_boundary(source, a, half),
+                    a,
+                    b,
+                    node_boundary(target, b, half),
+                ]
             };
             let screen = world.map(|p| viewport.transform.project(p));
             // Keep GPU path coordinates within tessellation precision even for extreme imports.
@@ -452,10 +550,70 @@ fn edge_curves<'a>(graph: &'a Graph, viewport: &Viewport) -> Vec<(&'a Edge, Curv
     curves
 }
 
-fn node_boundary(center: Coord, toward: Coord) -> Coord {
+fn node_half_size(mode: ProjectMode) -> Coord {
+    let height = match mode {
+        ProjectMode::Free => NODE_HEIGHT,
+        ProjectMode::Ddd => CARD_HEIGHT,
+    };
+    point(NODE_WIDTH / 2.0, height / 2.0)
+}
+
+fn node_boundary(center: Coord, toward: Coord, half: Coord) -> Coord {
     let delta = toward - center;
-    let ratio = (delta.x.abs() / (NODE_WIDTH / 2.0)).max(delta.y.abs() / (NODE_HEIGHT / 2.0));
+    let ratio = (delta.x.abs() / half.x).max(delta.y.abs() / half.y);
     center + delta / ratio.max(0.000_001)
+}
+
+fn label_bounds(center: Point<Pixels>, text_width: Pixels) -> Bounds<Pixels> {
+    Bounds::centered_at(center, size(text_width.min(px(165.)) + px(10.), px(18.)))
+}
+
+fn card_color(kind: CardKind) -> Hsla {
+    let color = match kind {
+        CardKind::ViewRead => 0x36a85c,
+        CardKind::Actor => 0xc99717,
+        CardKind::Command => 0x3178d4,
+        CardKind::Aggregate => 0xd56077,
+        CardKind::DomainEvent => 0xe37c39,
+        CardKind::Policy => 0x9564ca,
+        CardKind::ExternalSystem => 0x239e9e,
+    };
+    rgb(color).into()
+}
+
+fn card_background(background: Hsla, kind: Option<CardKind>) -> Hsla {
+    kind.map_or(background, |kind| {
+        background.blend(card_color(kind).opacity(0.27))
+    })
+}
+
+fn legend(cx: &App) -> impl IntoElement {
+    div()
+        .id("ddd-legend")
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .px_2()
+        .py_2()
+        .border_t_1()
+        .border_color(cx.theme().border)
+        .children(
+            CardKind::ALL
+                .into_iter()
+                .map(Some)
+                .chain([None])
+                .map(|kind| {
+                    div()
+                        .id(kind.map_or("unclassified", CardKind::key))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(card_background(cx.theme().background, kind))
+                        .px_2()
+                        .py_1()
+                        .child(Label::new(card_label(kind)).text_xs())
+                }),
+        )
 }
 
 fn draw_scene(scene: &Scene, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
@@ -483,16 +641,15 @@ fn draw_scene(scene: &Scene, bounds: Bounds<Pixels>, window: &mut Window, cx: &m
             x += spacing;
         }
 
-        for (curve, _, selected) in &scene.edges {
-            let [start, a, b, end] = curve.0;
-            let color = if *selected {
+        for edge in &scene.edges {
+            let [_, _, b, end] = edge.curve.0;
+            let color = if edge.selected {
                 selected_color
             } else {
                 edge_color
             };
-            let mut path = PathBuilder::stroke(px(if *selected { 2.5 } else { 1.5 }));
-            path.move_to(origin + pixel(start));
-            path.cubic_bezier_to(origin + pixel(end), origin + pixel(a), origin + pixel(b));
+            let mut path = PathBuilder::stroke(px(if edge.selected { 2.5 } else { 1.5 }));
+            edge.curve.trace(&mut path, origin, edge.dashed);
             if let Ok(path) = path.build() {
                 window.paint_path(path, color);
             }
@@ -511,16 +668,15 @@ fn draw_scene(scene: &Scene, bounds: Bounds<Pixels>, window: &mut Window, cx: &m
             }
         }
 
-        for (curve, label, selected) in &scene.edges {
-            let color = if *selected {
+        for edge in &scene.edges {
+            let color = if edge.selected {
                 selected_color
             } else {
                 text_color
             };
-            let center = origin + pixel(curve.label());
-            let line = shape(label, px(11.), color, &font, window);
-            let width = line.width().min(px(165.));
-            let rect = Bounds::centered_at(center, size(width + px(10.), px(18.)));
+            let center = origin + pixel(edge.curve.label());
+            let line = shape(&edge.label, px(11.), color, &font, window);
+            let rect = label_bounds(center, line.width());
             window.paint_quad(quad(
                 rect,
                 px(4.),
@@ -529,33 +685,96 @@ fn draw_scene(scene: &Scene, bounds: Bounds<Pixels>, window: &mut Window, cx: &m
                 border,
                 BorderStyle::Solid,
             ));
-            paint_text(line, center, width, px(16.), window, cx);
+            paint_text(line, center, rect.size.width - px(10.), px(16.), window, cx);
         }
 
-        for (center, name, selected) in &scene.nodes {
-            let center = origin + pixel(*center);
+        let half = node_half_size(scene.mode);
+        for node in &scene.nodes {
+            let center = origin + pixel(node.center);
             let scale = scene.transform.scale as f32;
-            let width = px(NODE_WIDTH as f32 * scale);
-            let height = px(NODE_HEIGHT as f32 * scale);
+            let width = px(2.0 * half.x as f32 * scale);
+            let height = px(2.0 * half.y as f32 * scale);
             let rect = Bounds::centered_at(center, size(width, height));
-            let color = if *selected { selected_color } else { border };
+            let kind = node.kind.filter(|_| scene.mode == ProjectMode::Ddd);
+            let color = if node.selected {
+                selected_color
+            } else {
+                kind.map_or(border, card_color)
+            };
             window.paint_quad(quad(
                 rect,
                 px(8. * scale),
-                node_color,
-                px(if *selected { 2. } else { 1. }),
+                card_background(node_color, kind),
+                px(if node.selected { 2. } else { 1. }),
                 color,
                 BorderStyle::Solid,
             ));
             if scale >= 0.36 {
-                let line = shape(
-                    name,
-                    px((13.0 * scale).clamp(8.0, 25.0)),
-                    text_color,
-                    &font,
-                    window,
-                );
-                paint_text(line, center, width - px(12. * scale), height, window, cx);
+                if scene.mode == ProjectMode::Ddd {
+                    paint_card(node, rect, scale, &font, window, cx);
+                } else {
+                    let line = shape(
+                        &node.name,
+                        px((13.0 * scale).clamp(8.0, 25.0)),
+                        text_color,
+                        &font,
+                        window,
+                    );
+                    paint_text(line, center, width - px(12. * scale), height, window, cx);
+                }
+            }
+        }
+    });
+}
+
+fn paint_card(
+    node: &CanvasNode,
+    rect: Bounds<Pixels>,
+    scale: f32,
+    font: &Font,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let inset = px(8. * scale);
+    let width = rect.size.width - 2. * inset;
+    let label = shape(
+        &card_label(node.kind).into(),
+        px(11. * scale),
+        cx.theme().foreground,
+        font,
+        window,
+    );
+    let header_height = px(14. * scale);
+    let header = point(rect.center().x, rect.origin.y + inset + header_height / 2.);
+    paint_text(label, header, width, header_height, window, cx);
+
+    let origin = rect.origin + point(inset, px(24. * scale));
+    let bounds = Bounds::new(origin, size(width, px(48. * scale)));
+    let run = text_run(&node.name, cx.theme().foreground, font);
+    let Ok(lines) = window.text_system().shape_text(
+        node.name.clone(),
+        px(13. * scale),
+        &[run],
+        Some(width),
+        Some(2),
+    ) else {
+        return;
+    };
+    let line_height = px(16. * scale);
+    window.with_content_mask(Some(ContentMask { bounds }), |window| {
+        let mut origin = origin;
+        for line in lines {
+            let _ = line.paint(
+                origin,
+                line_height,
+                TextAlign::Left,
+                Some(bounds),
+                window,
+                cx,
+            );
+            origin.y += line_height * (line.wrap_boundaries.len() + 1) as f32;
+            if origin.y >= bounds.origin.y + bounds.size.height {
+                break;
             }
         }
     });
@@ -568,17 +787,23 @@ fn shape(
     font: &Font,
     window: &Window,
 ) -> ShapedLine {
-    let run = TextRun {
+    window.text_system().shape_line(
+        text.clone(),
+        font_size,
+        &[text_run(text, color, font)],
+        None,
+    )
+}
+
+fn text_run(text: &str, color: Hsla, font: &Font) -> TextRun {
+    TextRun {
         len: text.len(),
         font: font.clone(),
         color,
         background_color: None,
         underline: None,
         strikethrough: None,
-    };
-    window
-        .text_system()
-        .shape_line(text.clone(), font_size, &[run], None)
+    }
 }
 
 fn paint_text(
@@ -620,7 +845,9 @@ fn coord(p: Point<Pixels>) -> Coord {
 
 #[cfg(test)]
 mod tests {
-    use super::{NODE_HEIGHT, NODE_WIDTH, Transform, node_boundary};
+    use super::{
+        CARD_HEIGHT, NODE_HEIGHT, NODE_WIDTH, ProjectMode, Transform, node_boundary, node_half_size,
+    };
     use gpui_kit::point;
 
     #[test]
@@ -642,13 +869,22 @@ mod tests {
     #[test]
     fn arrows_attach_to_the_side_facing_the_curve() {
         let node = point(120.0, 100.0);
+        let half = node_half_size(ProjectMode::Free);
         assert_eq!(
-            node_boundary(node, node + point(-100.0, 0.0)),
+            node_boundary(node, node + point(-100.0, 0.0), half),
             point(120.0 - NODE_WIDTH / 2.0, 100.0),
         );
         assert_eq!(
-            node_boundary(node, node + point(0.0, -100.0)),
+            node_boundary(node, node + point(0.0, -100.0), half),
             point(120.0, 100.0 - NODE_HEIGHT / 2.0),
+        );
+        assert_eq!(
+            node_boundary(
+                node,
+                node + point(0.0, -100.0),
+                node_half_size(ProjectMode::Ddd)
+            ),
+            point(120.0, 100.0 - CARD_HEIGHT / 2.0),
         );
     }
 
@@ -664,10 +900,10 @@ mod tests {
         };
 
         use super::{Editor, Selection, pixel};
-        use crate::{graph::Graph, storage::ProjectFile};
+        use crate::{graph::Graph, project::ProjectFile};
 
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("orders.sqlite");
+        let path = directory.path().join("orders.lbproj");
         let project = Arc::new(ProjectFile::create(&path, &Graph::default()).unwrap());
         let (window, editor) = cx.update(|cx| {
             gpui_kit::init(cx);
@@ -759,9 +995,237 @@ mod tests {
             assert!(state.error.is_none(), "{:?}", state.error);
             assert!(!state.has_changes(cx));
         });
-        let graph = project.read().unwrap();
+        let graph = project.reload().unwrap();
         assert_eq!(graph.nodes()[&order_id].name, "注文");
         assert_eq!(graph.edges().values().next().unwrap().label, "含む");
         assert!(graph.positions()[&order_id].y > original.y);
+    }
+
+    #[gpui_kit::test]
+    async fn edits_ddd_cards_and_arrows_and_saves_or_discards_mode_changes(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use std::time::Duration;
+
+        use gpui_kit::{
+            AppContext, Bounds, SharedString, WindowBounds, WindowOptions, px, size,
+            test::{TestAppContextExt, TestWindowExt},
+        };
+
+        use super::{Editor, Scene, Selection, pixel};
+        use crate::graph::{CardKind, DddRelation};
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("orders.lbproj");
+        let (window, editor) = cx.update(|cx| {
+            gpui_kit::init(cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(1240.), px(780.)),
+                ))),
+                ..Default::default()
+            };
+            gpui_kit::open_window(options, cx, |_, cx| {
+                let focus = cx.focus_handle();
+                cx.new(|_| Editor::new(focus))
+            })
+            .unwrap()
+        });
+        let click = |cx: &mut gpui_kit::TestAppContext, id: &'static str| {
+            cx.update(|cx| {
+                window
+                    .update(cx, |_, window, cx| window.click(id, cx))
+                    .unwrap()
+            });
+            cx.run_until_parked();
+        };
+        let choose =
+            |cx: &mut gpui_kit::TestAppContext, select: &'static str, item: SharedString| {
+                cx.update(|cx| {
+                    window
+                        .update(cx, |_, window, cx| {
+                            window.within(select).click("input", cx);
+                            assert_eq!(window.find(select).expanded(), Some(true));
+                            window.click(item, cx);
+                        })
+                        .unwrap()
+                });
+            };
+        let timeout = Duration::from_secs(4);
+        click(cx, "新規");
+        cx.simulate_prompt_answer(ProjectMode::Ddd.label());
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(path.clone()));
+        cx.wait_for(window, timeout, |_, cx| !editor.read(cx).busy)
+            .await;
+        assert_eq!(
+            cx.update(|cx| editor.read(cx).graph.mode()),
+            ProjectMode::Ddd
+        );
+
+        let mut ids = Vec::new();
+        for (kind, name) in [
+            (
+                CardKind::DomainEvent,
+                "会員が注文した書籍の配送先住所が確認された",
+            ),
+            (CardKind::Policy, "注文受付後に決済を依頼する"),
+        ] {
+            click(cx, "add-node");
+            cx.update(|cx| {
+                window
+                    .update(cx, |_, window, cx| window.input(name, cx))
+                    .unwrap()
+            });
+            click(cx, "switch-mode");
+            cx.update(|cx| {
+                assert_eq!(editor.read(cx).graph.mode(), ProjectMode::Ddd);
+                assert!(editor.read(cx).error.as_ref().unwrap().contains("反映"));
+            });
+            choose(cx, "card-kind", kind.key().into());
+            cx.wait_for(window, timeout, |window, _| {
+                window.find("card-kind").expanded() == Some(false)
+            })
+            .await;
+            click(cx, "apply");
+            cx.update(|cx| {
+                let editor = editor.read(cx);
+                let Some(Selection::Node(id)) = editor.selection() else {
+                    panic!("missing card selection")
+                };
+                assert_eq!(editor.graph.nodes()[&id].event_storming_kind, Some(kind));
+                assert_eq!(editor.graph.nodes()[&id].name, name);
+                ids.push(id);
+            });
+        }
+        let [event, policy] = ids.as_slice() else {
+            unreachable!()
+        };
+        let (event, policy) = (*event, *policy);
+        click(cx, "zoom-in");
+        cx.update(|cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    let state = editor.read(cx);
+                    let position = state.graph.positions()[&event];
+                    let viewport = &state.viewport;
+                    let start = viewport.bounds.get().origin
+                        + pixel(
+                            viewport
+                                .transform
+                                .project(point(position.x, position.y + 30.)),
+                        );
+                    assert!(
+                        viewport.hit(start, &state.graph, window) == Some(Selection::Node(event))
+                    );
+                    window.drag(start, start + point(px(12.), px(18.)), cx);
+                    assert!(editor.read(cx).graph.positions()[&event].y > position.y);
+                })
+                .unwrap()
+        });
+
+        click(cx, "add-edge");
+        choose(cx, "終点", policy.to_string().into());
+        cx.wait_for(window, timeout, |window, _| {
+            window.find("終点").expanded() == Some(false)
+        })
+        .await;
+        click(cx, "defined-relation");
+        click(cx, "apply");
+        let typed_edge = cx.update(|cx| {
+            let graph = &editor.read(cx).graph;
+            let edge = graph.edges().values().next().expect("typed arrow");
+            assert_eq!((edge.source_id, edge.target_id), (event, policy));
+            assert_eq!(edge.event_storming_relation, Some(DddRelation::Triggers));
+            assert_eq!(edge.label, DddRelation::Triggers.label());
+            edge.id
+        });
+        cx.update(|cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    window.click(SharedString::from(format!("node-{policy}")), cx);
+                    window.click("add-edge", cx);
+                    window.input("関連する", cx);
+                })
+                .unwrap()
+        });
+        choose(cx, "終点", event.to_string().into());
+        cx.wait_for(window, timeout, |window, _| {
+            window.find("終点").expanded() == Some(false)
+        })
+        .await;
+        click(cx, "apply");
+        cx.update(|cx| {
+            let editor = editor.read(cx);
+            assert_eq!(editor.graph.edges().len(), 2);
+            let scene = Scene::new(editor, editor.viewport.bounds.get());
+            assert_eq!(scene.edges.iter().filter(|edge| edge.dashed).count(), 1);
+        });
+        click(cx, "保存");
+        cx.wait_for(window, timeout, |_, cx| !editor.read(cx).busy)
+            .await;
+        let saved = cx.update(|cx| {
+            let editor = editor.read(cx);
+            assert!(!editor.has_changes(cx));
+            let saved = editor.project.as_ref().unwrap().reload().unwrap();
+            assert_eq!(saved, editor.graph);
+            saved
+        });
+
+        click(cx, "switch-mode");
+        cx.update(|cx| assert!(editor.read(cx).has_changes(cx)));
+        click(cx, "開く");
+        cx.simulate_prompt_answer("破棄");
+        cx.run_until_parked();
+        cx.simulate_path_prompt_response(|_| Some(vec![path]));
+        cx.wait_for(window, timeout, |_, cx| !editor.read(cx).busy)
+            .await;
+        cx.update(|cx| assert_eq!(editor.read(cx).graph, saved));
+
+        click(cx, "switch-mode");
+        click(cx, "保存");
+        cx.wait_for(window, timeout, |_, cx| !editor.read(cx).busy)
+            .await;
+        let mut expected = saved;
+        expected.set_mode(ProjectMode::Free);
+        cx.update(|cx| {
+            let editor = editor.read(cx);
+            assert!(!editor.has_changes(cx));
+            assert_eq!(editor.project.as_ref().unwrap().reload().unwrap(), expected);
+        });
+        cx.update(|cx| {
+            window
+                .update(cx, |_, window, cx| {
+                    window.click(SharedString::from(format!("edge-{typed_edge}")), cx);
+                })
+                .unwrap()
+        });
+        choose(cx, "終点", event.to_string().into());
+        cx.wait_for(window, timeout, |window, _| {
+            window.find("終点").expanded() == Some(false)
+        })
+        .await;
+        click(cx, "apply");
+        cx.update(|cx| {
+            let editor = editor.read(cx);
+            assert_eq!(editor.graph, expected);
+            assert!(
+                editor
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("event_storming_relation")
+            );
+        });
+        click(cx, "free-relation");
+        click(cx, "apply");
+        cx.update(|cx| {
+            let editor = editor.read(cx);
+            let edge = &editor.graph.edges()[&typed_edge];
+            assert_eq!((edge.source_id, edge.target_id), (event, event));
+            assert!(edge.event_storming_relation.is_none());
+            assert!(editor.error.is_none());
+        });
     }
 }
