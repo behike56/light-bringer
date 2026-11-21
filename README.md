@@ -22,4 +22,4 @@ DDDモードでは7種類のカードと矢印で業務の流れを表せます�
 
 ## Neo4j に公開する
 
-保存済みの JSON、`.lbproj`、旧 `.sqlite` を公開し、公開内容の照合や DDD の経路検索を行えます。[Neo4j CLI の手順](docs/neo4j.md)
+保存済みの JSON、`.lbproj`、旧 `.sqlite` を公開し、公開内容の照合や DDD の経路検索を行えます。[Neo4j CLI の手順](docs/neo4j.md) · [サーバーの構築・復旧手順](docs/neo4j-server.md)

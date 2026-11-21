@@ -1,0 +1,8 @@
+services:
+  neo4j:
+    image: neo4j:5.26.33-enterprise
+    environment:
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: ${LB_NEO4J_ACCEPT_LICENSE_AGREEMENT:?Enterprise ライセンスを確認し yes を設定してください}
+      NEO4J_server_backup_enabled: "true"
+      NEO4J_server_backup_listen__address: 127.0.0.1:6362
+      NEO4J_db_logs_query_parameter__logging__enabled: "false"

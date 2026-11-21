@@ -1,0 +1,50 @@
+name: light-bringer-neo4j
+
+services:
+  neo4j:
+    image: neo4j:5.26.33
+    user: ${LB_NEO4J_RUN_AS:-7474:7474}
+    restart: unless-stopped
+    stop_grace_period: 1m
+    ports:
+      - "${LB_NEO4J_BIND_IP:-127.0.0.1}:${LB_NEO4J_HTTPS_PORT:-7473}:7473"
+    environment:
+      NEO4J_AUTH_FILE: /run/secrets/neo4j_auth
+      NEO4J_dbms_usage__report_enabled: "false"
+      NEO4J_server_default__listen__address: 0.0.0.0
+      NEO4J_server_http_enabled: "false"
+      NEO4J_server_https_enabled: "true"
+      NEO4J_server_bolt_listen__address: 127.0.0.1:7687
+      NEO4J_dbms_ssl_policy_https_enabled: "true"
+      NEO4J_dbms_ssl_policy_https_base__directory: /run/neo4j-tls
+      NEO4J_dbms_ssl_policy_https_client__auth: NONE
+    secrets:
+      - neo4j_auth
+    volumes:
+      - data:/data
+      - logs:/logs
+      - type: bind
+        source: ${LB_NEO4J_TLS_DIR:-./.runtime/https}
+        target: /run/neo4j-tls
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${LB_NEO4J_BACKUP_DIR:-./.runtime/backups}
+        target: /backups
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/7473"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 60s
+
+secrets:
+  neo4j_auth:
+    file: ${LB_NEO4J_AUTH_FILE:-./.runtime/auth.txt}
+
+volumes:
+  data:
+  logs:

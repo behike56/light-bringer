@@ -2,6 +2,8 @@
 
 Light Bringer の保存済みグラフを CLI から Neo4j に公開し、公開リビジョンを読み戻せます。ローカルの保存と再読込はオフラインで行えます。公開のデータモデルと導入段階は [Neo4j 導入設計](design/neo4j-integration-design.md) を参照してください。
 
+接続先を新設する場合は、[サーバーの構築・復旧手順](neo4j-server.md) に沿って構築してください。
+
 ## 接続を設定する
 
 Neo4j 5.26 以降の Query API を、クライアントが信頼する証明書を使った HTTPS で利用します。接続先に単一インスタンスを指定します。プライベート CA を使う場合は、PEM 形式の CA 証明書のパスを環境変数 `NEO4J_CA_CERT` に設定します。 [Neo4j Query API のトランザクション](https://neo4j.com/docs/query-api/current/transactions/)
