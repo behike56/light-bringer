@@ -19,3 +19,7 @@ DDDモードでは7種類のカードと矢印で業務の流れを表せます�
 「JSON 書出」は最後に保存したグラフを書き出します。「JSON 取込」は JSON から新しい `.lbproj` を作成します。新規作成、別名保存、JSON の取り込みと書き出しには新しいファイル名を指定します。
 
 [デスクトップアプリの設計](docs/design/desktop-app.md) · [プロジェクトファイル設計](docs/design/project-file.md) · [DDDモードの設計](docs/design/event-storming.md)
+
+## Neo4j に公開する
+
+保存済みの JSON、`.lbproj`、旧 `.sqlite` を公開し、公開内容の照合や DDD の経路検索を行えます。[Neo4j CLI の手順](docs/neo4j.md)

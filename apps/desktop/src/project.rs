@@ -86,6 +86,14 @@ pub fn has_extension(path: &Path, extension: &str) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case(extension))
 }
 
+pub fn read_container_snapshot(path: &Path) -> Result<(u32, Graph)> {
+    let path = path
+        .canonicalize()
+        .context("プロジェクトのファイルが見つかりません")?;
+    let (_, version, graph) = read_project(&path)?;
+    Ok((version, graph))
+}
+
 pub struct Container {
     path: PathBuf,
     _session_lock: File,
